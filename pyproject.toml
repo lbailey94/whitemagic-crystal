@@ -32,6 +32,11 @@ dependencies = [
     "cryptography>=41.0.0",
 ]
 
+[project.urls]
+Homepage = "https://www.whitemagic.dev/hosted#crystals"
+Repository = "https://github.com/lbailey94/whitemagic-crystal"
+Documentation = "https://www.whitemagic.dev/hosted#crystals"
+
 [project.scripts]
 whitemagic-crystal = "whitemagic_crystal.cli:main"
 
