@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whitemagic-crystal"
+version = "0.1.0"
+description = "Sovereign client-side encrypted memory crystals for AI agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "WhiteMagic Labs", email = "contact@whitemagic.dev"}
+]
+keywords = [
+    "whitemagic",
+    "crystal",
+    "encrypted-memory",
+    "agent-memory",
+    "privacy",
+    "sovereignty",
+    "aead",
+    "ed25519"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "cryptography>=41.0.0",
+]
+
+[project.scripts]
+whitemagic-crystal = "whitemagic_crystal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["whitemagic_crystal*"]
