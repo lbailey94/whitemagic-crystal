@@ -31,25 +31,31 @@ pip install -e .
 First generate a 32-byte encryption key with a trusted random generator and retain it in your secret manager, with a protected recovery backup. Supply the **same** key on each run as base64 in `WM_CRYSTAL_KEY`, or pass its bytes as `key=` from your secret manager. Configure the environment through your deployment's secret mechanism rather than pasting the key into source code or shell history. Treat access to that key as access to the encrypted memories.
 
 ```python
-from whitemagic_crystal import CrystalClient
+from whitemagic_crystal import CrystalClient, fetch_owner_locator
+
+# Fetch the gateway-assigned locator explicitly, after authentication.
+# This makes a network request; do not use it for an offline-only example.
+token = "<your-wm-token>"
+owner = fetch_owner_locator(auth_token=token)
 
 # 1. Initialize using the retained WM_CRYSTAL_KEY.
 client = CrystalClient(
     tenant_id="sol-agent-1",
-    auth_token="<your-wm-token>", # or set WM_HOSTED_TOKEN
+    auth_token=token, # or set WM_HOSTED_TOKEN
+    owner_locator=owner,
 )
 
 # 2. Seal plaintext into an encrypted envelope
 envelope = client.seal(
     "Critical task discovery: production database uses Landlock LSM sandbox."
 )
-print("Sealed Crystal ID:", envelope["id"])
+print("Sealed Crystal ID:", envelope["crystal_id"])
 
 # 3. Push to hosted vault
 client.push(envelope)
 
 # 4. Pull and unseal locally
-envelope, plaintext = client.pull_text(envelope["id"])
+envelope, plaintext = client.pull_text(envelope["crystal_id"])
 print("Decrypted Plaintext:", plaintext)
 ```
 
@@ -64,6 +70,10 @@ Creating a client with no key previously generated a new key silently. This unre
 Signatures are optional by default. Provide a separate 32-byte Ed25519 private seed as hex via `signing_key_hex` or `WM_CRYSTAL_SIGNING_KEY` to sign new envelopes. `seal(sign=True)` requires one; `seal(sign=False)` deliberately skips signing. Keep the signing seed separate from the encryption key. Signing does not establish the signer's authorization, capture completeness, or actual execution.
 
 The prior `verify_set(envelopes, expected_root)` method was nonfunctional. It now takes a signed commitment object and a caller-pinned `anchor_public_key` keyword, and raises on failure. The commitment and key must come from an independently retained trusted source; the caller must also determine whether the commitment is current. Matching the committed prefix does not establish freshness, authorized signers, deletion, or complete server history. Unversioned unsigned envelopes do not authenticate public metadata such as tags.
+
+The candidate uses `crystal_id` as its envelope identifier; the former `id` alias is removed because the gateway does not preserve it in signed envelopes. Hosted operations require the authenticated `owner_locator` and now default to `https://api.whitemagic.dev`; local-only clients may omit the locator. Do not assume a tenant label is the gateway-assigned locator. A pull with `auto_unseal=False` checks the returned ID and context labels but does not verify its ciphertext or signature. The hosted journey is covered by local mocks and source inspection only; a live hosted handshake remains unqualified.
+
+The session adapters keep their history in the current process. Their public tags include session ID and message role. `clear()` resets local state and does not delete hosted crystals. If `auto_push` raises, inspect `pending_envelope`, verify whether the gateway stored that exact crystal, and only then call `resolve_pending(confirmed_stored=True)` or, after establishing it was not stored, `resolve_pending(confirmed_stored=False)`. A lost or malformed response can follow a successful write, so a failed request alone does not prove absence. A process restart loses this in-memory pending state; durable reconciliation is the caller's responsibility.
 
 ## CLI Usage
 

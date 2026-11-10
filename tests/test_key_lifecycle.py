@@ -28,6 +28,8 @@ class TestKeyLifecycle(unittest.TestCase):
         self.assertEqual(client.unseal_text(envelope), "local demo")
         with self.assertRaises(CrystalVerificationError):
             CrystalClient("demo", ephemeral=True).unseal(envelope)
+        with self.assertRaisesRegex(ValueError, "ephemeral"):
+            CrystalClient("demo", ephemeral="false")
 
     def test_retained_key_recovers_in_fresh_process(self):
         key = generate_key()
@@ -59,6 +61,8 @@ class TestKeyLifecycle(unittest.TestCase):
         self.assertNotIn("client_sig", plain.seal("unsigned"))
         with self.assertRaisesRegex(ValueError, "sign=True"):
             plain.seal("unsigned", sign=True)
+        with self.assertRaisesRegex(ValueError, "sign must"):
+            plain.seal("unsigned", sign="true")
         signer = CrystalClient("demo", key=key, signing_key_hex=generate_key().hex())
         envelope = signer.seal("signed", sign=True)
         self.assertIn("client_sig", envelope)

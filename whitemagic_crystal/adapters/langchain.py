@@ -47,7 +47,7 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
 
     @property
     def messages(self) -> list[Any]:
-        """Retrieve and reconstruct LangChain messages from unsealed crystal history."""
+        """Reconstruct messages held by this manager instance; no remote reload is performed."""
         history = self.manager.get_history()
         if not HAS_LANGCHAIN:
             return history
@@ -87,6 +87,5 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
         self.manager.append(role="assistant", content=message)
 
     def clear(self) -> None:
-        """Clear local session turns and reset chain head."""
-        self.manager._local_history.clear()
-        self.manager.head_crystal_id = None
+        """Clear local session state only; no remote crystals are deleted."""
+        self.manager.clear()

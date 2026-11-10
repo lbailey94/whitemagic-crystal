@@ -16,13 +16,13 @@ def main():
 
     print("\n[Step 1] Appending conversational turns to encrypted session...")
     t1 = manager.append("user", "Remember the next project milestone.")
-    print(f"  Turn 1 sealed into Crystal ID: {t1['id']}")
+    print(f"  Turn 1 sealed into Crystal ID: {t1['crystal_id']}")
 
     t2 = manager.append(
         "assistant",
         "The next milestone is a local recovery test.",
     )
-    print(f"  Turn 2 sealed into Crystal ID: {t2['id']}")
+    print(f"  Turn 2 sealed into Crystal ID: {t2['crystal_id']}")
     print(f"    Parent Crystal Link: {t2['parent_crystal_id']}")
 
     print("\n[Step 2] Formatting decrypted context prompt for LLM call:")
@@ -32,7 +32,7 @@ def main():
 
     print("\n[Step 3] Emitting an encrypted milestone checkpoint...")
     checkpoint = manager.commit_checkpoint("The next milestone is a local recovery test.")
-    print(f"  Checkpoint Crystal ID: {checkpoint['id']}")
+    print(f"  Checkpoint Crystal ID: {checkpoint['crystal_id']}")
     print(f"  Committed Turn Count: 2")
 
     print("\n[Step 4] Tamper Verification Test:")

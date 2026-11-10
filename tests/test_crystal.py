@@ -28,8 +28,8 @@ class TestWhitemagicCrystal(unittest.TestCase):
     def test_seal_unseal_roundtrip_string(self):
         secret = "Sovereign intelligence requires client-side encrypted memory."
         envelope = self.client.seal(secret)
-        self.assertIn("id", envelope)
-        self.assertTrue(envelope["id"].startswith("sha256:"))
+        self.assertIn("crystal_id", envelope)
+        self.assertTrue(envelope["crystal_id"].startswith("sha256:"))
         self.assertEqual(envelope["tenant_hash"], self.client.tenant_hash)
 
         plaintext = self.client.unseal(envelope)
@@ -57,14 +57,14 @@ class TestWhitemagicCrystal(unittest.TestCase):
 
     def test_lineage_chaining(self):
         c1 = self.client.seal("Turn 1: Observe state")
-        c2 = self.client.seal("Turn 2: Execute action", parent_id=c1["id"])
-        self.assertEqual(c2["parent_crystal_id"], c1["id"])
+        c2 = self.client.seal("Turn 2: Execute action", parent_id=c1["crystal_id"])
+        self.assertEqual(c2["parent_crystal_id"], c1["crystal_id"])
 
     def test_session_memory_manager(self):
         manager = SessionMemoryManager(session_id="sess-100", client=self.client)
         e1 = manager.append("user", "Hello agent")
         e2 = manager.append("assistant", "Hello human, memory is encrypted")
-        self.assertEqual(manager.head_crystal_id, e2["id"])
+        self.assertEqual(manager.head_crystal_id, e2["crystal_id"])
 
         history = manager.get_history()
         self.assertEqual(len(history), 2)
