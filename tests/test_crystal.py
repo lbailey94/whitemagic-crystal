@@ -17,7 +17,7 @@ from whitemagic_crystal.adapters.langchain import CrystalChatMessageHistory
 class TestWhitemagicCrystal(unittest.TestCase):
     def setUp(self):
         self.tenant_id = "test-agent-alpha"
-        self.client = CrystalClient(tenant_id=self.tenant_id)
+        self.client = CrystalClient(tenant_id=self.tenant_id, key=generate_key())
 
     def test_keygen_aes_and_chacha(self):
         k_aes = generate_key("AES-256-GCM")
