@@ -73,7 +73,26 @@ The prior `verify_set(envelopes, expected_root)` method was nonfunctional. It no
 
 The candidate uses `crystal_id` as its envelope identifier; the former `id` alias is removed because the gateway does not preserve it in signed envelopes. Hosted operations require the authenticated `owner_locator` and now default to `https://api.whitemagic.dev`; local-only clients may omit the locator. Do not assume a tenant label is the gateway-assigned locator. A pull with `auto_unseal=False` checks the returned ID and context labels but does not verify its ciphertext or signature. The hosted journey is covered by local mocks and source inspection only; a live hosted handshake remains unqualified.
 
-The session adapters keep their history in the current process. Their public tags include session ID and message role. `clear()` resets local state and does not delete hosted crystals. If `auto_push` raises, inspect `pending_envelope`, verify whether the gateway stored that exact crystal, and only then call `resolve_pending(confirmed_stored=True)` or, after establishing it was not stored, `resolve_pending(confirmed_stored=False)`. A lost or malformed response can follow a successful write, so a failed request alone does not prove absence. A process restart loses this in-memory pending state; durable reconciliation is the caller's responsibility.
+Session adapters use process-local state by default. To retain history, the chain head, and uncertain pushes across restarts, pass `state_path=` to `SessionMemoryManager` or `CrystalChatMessageHistory`:
+
+```python
+from pathlib import Path
+from whitemagic_crystal.adapters.generic import SessionMemoryManager
+
+state_dir = Path.home() / ".local" / "state" / "my-agent-crystals"
+state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+memory = SessionMemoryManager(
+    "project-session", client, auto_push=True,
+    state_path=state_dir / "session.sqlite3",
+)
+# Reopen with the same session, client context, and retained encryption key.
+```
+
+The state file contains encrypted history and pending envelopes, without the encryption key or hosted token. On POSIX, its existing parent must be owned by the current user with no group/other permissions; the database is created with mode `0600`. Symlink paths are refused. On other systems, protect the directory with the platform's access controls. Back up the database separately from the key using a consistent SQLite backup method or while all managers are closed. Losing either the database or key prevents this local restoration.
+
+Before a push, the exact pending envelope is committed to SQLite. If `auto_push` raises, or the process exits while waiting for a response, reopening preserves that envelope and blocks new entries. Inspect `pending_envelope`, verify whether the gateway stored that exact crystal, then call `resolve_pending(confirmed_stored=True)` or, after establishing it was not stored, `resolve_pending(confirmed_stored=False)`. This method records the caller's verdict without contacting the gateway. A failed request alone does not establish absence. A local write failure after remote success also leaves the saved pending entry for reconciliation.
+
+Revision checks reject writes from stale manager instances before sending another envelope; reopen to reload the latest local state. Use one owner per session to coordinate live requests and reconciliation. The journal does not establish remote freshness or prevent replay of an older valid database. `clear()` resets the local session (including the journal when configured) and does not delete hosted crystals. SQLite transaction recovery is used; power-loss behavior depends on the filesystem and storage. Public envelope tags still disclose session ID and message role.
 
 ## CLI Usage
 

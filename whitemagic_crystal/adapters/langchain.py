@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ..client import CrystalClient
@@ -36,6 +37,8 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
         session_id: str,
         client: CrystalClient,
         auto_push: bool = False,
+        *,
+        state_path: str | os.PathLike[str] | None = None,
     ):
         self.session_id = session_id
         self.client = client
@@ -43,6 +46,7 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
             session_id=session_id,
             client=client,
             auto_push=auto_push,
+            state_path=state_path,
         )
 
     @property
