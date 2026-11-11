@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ..client import CrystalClient
@@ -36,6 +37,8 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
         session_id: str,
         client: CrystalClient,
         auto_push: bool = False,
+        *,
+        state_path: str | os.PathLike[str] | None = None,
     ):
         self.session_id = session_id
         self.client = client
@@ -43,11 +46,12 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
             session_id=session_id,
             client=client,
             auto_push=auto_push,
+            state_path=state_path,
         )
 
     @property
     def messages(self) -> list[Any]:
-        """Retrieve and reconstruct LangChain messages from unsealed crystal history."""
+        """Reconstruct messages held by this manager instance; no remote reload is performed."""
         history = self.manager.get_history()
         if not HAS_LANGCHAIN:
             return history
@@ -87,6 +91,5 @@ class CrystalChatMessageHistory(BaseChatMessageHistory):
         self.manager.append(role="assistant", content=message)
 
     def clear(self) -> None:
-        """Clear local session turns and reset chain head."""
-        self.manager._local_history.clear()
-        self.manager.head_crystal_id = None
+        """Clear local session state only; no remote crystals are deleted."""
+        self.manager.clear()

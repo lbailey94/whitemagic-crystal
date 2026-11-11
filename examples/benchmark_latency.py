@@ -7,7 +7,7 @@ from whitemagic_crystal import CrystalClient, generate_key
 
 
 def benchmark_cipher(cipher_name: str, payload_size_bytes: int = 1024, iterations: int = 1000):
-    client = CrystalClient(tenant_id="bench-agent", cipher=cipher_name)
+    client = CrystalClient(tenant_id="bench-agent", cipher=cipher_name, ephemeral=True)
     payload = "A" * payload_size_bytes
 
     # Seal benchmark
