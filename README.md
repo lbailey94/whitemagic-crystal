@@ -20,11 +20,18 @@ The client does not put the plaintext or encryption key in the envelope. Avoid p
 
 ## Installation
 
+The APIs below describe the unreleased `0.2.0.dev0` source. To review or use
+this candidate, install this checkout in an isolated Python environment:
+
 ```bash
-pip install whitemagic-crystal
-# Or from a local checkout:
-pip install -e .
+python -m pip install .
+# For development in this checkout:
+python -m pip install -e .
 ```
+
+Installing only the name `whitemagic-crystal` selects a published PyPI release,
+which can have a different API. Use that release's documentation when working
+with its package; merging this source does not publish a new PyPI version.
 
 ## Quickstart
 
