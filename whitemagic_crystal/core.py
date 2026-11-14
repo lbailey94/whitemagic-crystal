@@ -27,6 +27,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
+from pathlib import Path
 from typing import Any
 
 try:
@@ -54,6 +56,15 @@ class CrystalVerificationError(ValueError):
 
 class CrystalRollbackError(CrystalVerificationError):
     """Raised when a crystal store is rolled back or truncated relative to an anchor commitment."""
+
+
+class CrystalUnanchoredWarning(UserWarning):
+    """A crystal set was verified without an off-store anchor commitment.
+
+    Without a signed commitment held outside the store, whole-store snapshot
+    rollback (T9) and erasure resurrection (T10) cannot be detected: a restored
+    copy carries any in-store commitment back with it.
+    """
 
 
 class CrystalLineageError(CrystalVerificationError):
@@ -403,39 +414,39 @@ def verify_crystal_client_sig(
         return True
     _require_crypto()
     if not isinstance(sig_obj, dict):
-        raise ValueError("client_sig must be an object")
+        raise CrystalVerificationError("client_sig must be an object")
     alg = str(sig_obj.get("alg") or "")
     if alg not in SUPPORTED_CLIENT_SIG_ALGS:
-        raise ValueError(f"unsupported client_sig alg: {alg!r}")
+        raise CrystalVerificationError(f"unsupported client_sig alg: {alg!r}")
     canon = _canonical_envelope_bytes_for_sig(crystal_envelope)
     pub_hex = str(sig_obj.get("public_key") or "")
     sig_b64 = str(sig_obj.get("sig") or "")
     try:
         pub_raw = bytes.fromhex(pub_hex)
         if len(pub_raw) != 32:
-            raise ValueError("Ed25519 public_key must be 32 bytes")
+            raise CrystalVerificationError("Ed25519 public_key must be 32 bytes")
         pub = Ed25519PublicKey.from_public_bytes(pub_raw)
         raw_sig = base64.urlsafe_b64decode(sig_b64 + "=" * (-len(sig_b64) % 4))
         pub.verify(raw_sig, canon)
     except Exception as exc:
-        raise ValueError(f"client_sig Ed25519 verification failed: {exc}") from exc
+        raise CrystalVerificationError(f"client_sig Ed25519 verification failed: {exc}") from exc
 
     if alg == "ed25519+ml-dsa-65":
         pq_alg = sig_obj.get("pq_alg")
         if pq_alg not in (None, "ml-dsa-65"):
-            raise ValueError(f"unsupported hybrid pq_alg: {pq_alg!r}")
+            raise CrystalVerificationError(f"unsupported hybrid pq_alg: {pq_alg!r}")
         pq_sig = sig_obj.get("pq_sig")
         pq_pub = sig_obj.get("pq_public_key")
         if not pq_sig or not isinstance(pq_sig, str):
-            raise ValueError("client_sig missing pq_sig for hybrid ML-DSA-65 profile")
+            raise CrystalVerificationError("client_sig missing pq_sig for hybrid ML-DSA-65 profile")
         if not pq_pub or not isinstance(pq_pub, str):
-            raise ValueError("client_sig missing pq_public_key for hybrid ML-DSA-65 profile")
+            raise CrystalVerificationError("client_sig missing pq_public_key for hybrid ML-DSA-65 profile")
         if pq_verifier is None:
-            raise ValueError(
+            raise CrystalVerificationError(
                 "client_sig uses hybrid ed25519+ml-dsa-65 profile, which requires an explicit pq_verifier callback (fail-closed)"
             )
         if not pq_verifier(pq_pub, canon, pq_sig):
-            raise ValueError("client_sig ML-DSA-65 verification failed")
+            raise CrystalVerificationError("client_sig ML-DSA-65 verification failed")
     return True
 
 
@@ -453,11 +464,11 @@ def unseal_crystal(
     if crystal_envelope.get("dek_destroyed") is True or (
         "kek_version" in crystal_envelope and crystal_envelope.get("wrapped_dek") is None
     ):
-        raise ValueError("crystal DEK has been scrubbed from this envelope; cannot decrypt without wrapped_dek")
+        raise CrystalVerificationError("crystal DEK has been scrubbed from this envelope; cannot decrypt without wrapped_dek")
 
     for field in ("crystal_id", "tenant_hash", "cipher", "nonce", "ciphertext", "created_at"):
         if field not in crystal_envelope:
-            raise ValueError(f"malformed envelope: missing field {field!r}")
+            raise CrystalVerificationError(f"malformed envelope: missing field {field!r}")
 
     if "client_sig" in crystal_envelope:
         verify_crystal_client_sig(crystal_envelope, pq_verifier=pq_verifier)
@@ -470,12 +481,12 @@ def unseal_crystal(
     id_kek_version = crystal_envelope.get("id_kek_version", kek_version)
     expected_id = compute_crystal_id(ciphertext, nonce=nonce, id_kek_version=id_kek_version)
     if crystal_envelope["crystal_id"].lower() != expected_id.lower():
-        raise ValueError(f"crystal content-address verification failed: {crystal_envelope['crystal_id']} != {expected_id}")
+        raise CrystalVerificationError(f"crystal content-address verification failed: {crystal_envelope['crystal_id']} != {expected_id}")
 
     payload_key = key
     if crystal_envelope.get("wrapped_dek") is not None:
         if kek_version is None:
-            raise ValueError("malformed envelope: wrapped_dek present without kek_version")
+            raise CrystalVerificationError("malformed envelope: wrapped_dek present without kek_version")
         payload_key = unwrap_crystal_dek(
             crystal_envelope["wrapped_dek"],
             key,
@@ -498,17 +509,67 @@ def unseal_crystal(
         raise CrystalVerificationError(f"AEAD decryption or integrity tag verification failed: {exc}") from exc
 
 
+def _erased_ids_digest(erasures: list[dict[str, Any]]) -> tuple[int, str]:
+    """(count, digest) over the sorted set of erased crystal ids."""
+    erased_ids = sorted({str(e.get("crystal_id", "")).lower() for e in erasures})
+    digest = "sha256:" + hashlib.sha256("\n".join(erased_ids).encode("utf-8")).hexdigest()
+    return len(erased_ids), digest
+
+
+def _check_erasure_binding(
+    commitment: dict[str, Any],
+    erasures: list[dict[str, Any]] | None,
+    crystal_ids: list[str],
+    where: str,
+) -> None:
+    """T10 (erasure resurrection): an erasure-aware commitment must still match
+    the store after a pre-erasure copy has been restored over it.
+
+    A high-water cell count alone cannot catch this: erasure *lowers* the count,
+    so a restored pre-erasure copy is a superset of what the anchor recorded and
+    passes a ``len(store) >= count`` check. The commitment therefore also carries
+    ``erasure_count``, ``erased_crystal_ids_digest`` and ``revision`` (cells +
+    erasures, which strictly increases on every add *and* every erase).
+    """
+    if "revision" not in commitment and "erasure_count" not in commitment:
+        return
+    if erasures is None:
+        raise CrystalRollbackError(
+            f"{where}: anchor commits to an erasure-aware state but no erasure list was supplied"
+        )
+    count, digest = _erased_ids_digest(erasures)
+    if count != int(commitment.get("erasure_count", -1)):
+        raise CrystalRollbackError(
+            f"{where}: erasure_count mismatch: store has {count}, anchor committed to {commitment.get('erasure_count')}"
+        )
+    if digest != commitment.get("erased_crystal_ids_digest"):
+        raise CrystalRollbackError(f"{where}: erased_crystal_ids_digest mismatch against anchor commitment")
+    revision = len(crystal_ids) + count
+    if "revision" in commitment and revision != int(commitment["revision"]):
+        raise CrystalRollbackError(
+            f"{where}: revision mismatch: store is at {revision}, anchor committed to {commitment['revision']}"
+        )
+    erased = {str(e.get("crystal_id", "")).lower() for e in erasures}
+    overlap = sorted(erased.intersection(crystal_ids))
+    if overlap:
+        raise CrystalRollbackError(f"{where}: erased crystal served again: {overlap[0]}")
+
+
 def compute_crystal_set_commitment(
     crystals: list[dict[str, Any]],
     tenant_hash: str,
     *,
     retrieved_at: str | None = None,
     signing_key: bytes | None = None,
+    erasures: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compute an export-level head and ordered-set commitment over a sequence of crystals (I6).
 
     Binds ``count``, ``ordered_crystal_ids_digest``, ``head_crystal_id``, ``tenant_hash``,
-    ``spec``, and ``retrieved_at`` inside the signed commitment payload.
+    ``spec``, and ``retrieved_at`` inside the signed commitment payload. When
+    ``erasures`` is supplied it also binds ``erasure_count``,
+    ``erased_crystal_ids_digest`` and ``revision``, which is what lets a verifier
+    catch a restored pre-erasure copy (T10).
     """
     ordered_ids = [str(c["crystal_id"]).lower() for c in crystals]
     ordered_digest = "sha256:" + hashlib.sha256("\n".join(ordered_ids).encode("utf-8")).hexdigest()
@@ -524,6 +585,11 @@ def compute_crystal_set_commitment(
         "head_crystal_id": head_id,
         "retrieved_at": ts,
     }
+    if erasures is not None:
+        erasure_count, erasure_digest = _erased_ids_digest(erasures)
+        commitment["erasure_count"] = erasure_count
+        commitment["erased_crystal_ids_digest"] = erasure_digest
+        commitment["revision"] = len(ordered_ids) + erasure_count
     canon = json.dumps(commitment, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     commitment_digest = "sha256:" + hashlib.sha256(canon).hexdigest()
     if signing_key is not None:
@@ -542,6 +608,240 @@ def compute_crystal_set_commitment(
     return commitment
 
 
+def _require_32b_key(raw: bytes, label: str) -> bytes:
+    if not isinstance(raw, bytes) or len(raw) != 32:
+        raise ValueError(f"{label} must be 32 bytes")
+    return raw
+
+
+def _validate_commitment_envelope(
+    expected_commitment: dict[str, Any],
+    expected_tenant_hash: str,
+    *,
+    anchor_public_key: bytes | None = None,
+) -> None:
+    """Validate structure, digest, signature, and tenant binding on a set commitment."""
+    if not isinstance(expected_commitment, dict) or expected_commitment.get("kind") != "wm.crystal-set-commitment":
+        raise CrystalRollbackError("invalid or missing crystal-set commitment")
+    version = expected_commitment.get("version")
+    if type(version) is not int or version != 1:
+        raise CrystalRollbackError("unsupported or invalid anchor commitment version")
+    if expected_commitment.get("spec") != SPEC:
+        raise CrystalRollbackError("anchor commitment spec mismatch")
+    count = expected_commitment.get("count")
+    if type(count) is not int or count < 0:
+        raise CrystalRollbackError("invalid anchor commitment count")
+    if expected_commitment.get("tenant_hash") != expected_tenant_hash:
+        raise CrystalContextError("anchor commitment tenant_hash mismatch")
+    for int_field in ("erasure_count", "revision"):
+        if int_field in expected_commitment:
+            val = expected_commitment[int_field]
+            if type(val) is not int or val < 0:
+                raise CrystalRollbackError(f"invalid anchor commitment {int_field}")
+    unsigned = {
+        k: v for k, v in expected_commitment.items()
+        if k not in ("sig", "commitment_digest")
+    }
+    canon = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    expected_digest = "sha256:" + hashlib.sha256(canon).hexdigest()
+    carried_digest = expected_commitment.get("commitment_digest")
+    if carried_digest is not None and carried_digest != expected_digest:
+        raise CrystalRollbackError("anchor commitment_digest mismatch")
+    if anchor_public_key is not None:
+        _require_crypto()
+        pub_key_bytes = _require_32b_key(anchor_public_key, "anchor_public_key")
+        sig_obj = expected_commitment.get("sig")
+        if not isinstance(sig_obj, dict) or sig_obj.get("alg") != "ed25519":
+            raise CrystalRollbackError("anchor commitment is unsigned or uses unsupported alg")
+        carried_pub = sig_obj.get("public_key")
+        if not isinstance(carried_pub, str) or carried_pub.lower() != pub_key_bytes.hex().lower():
+            raise CrystalRollbackError("anchor commitment public_key mismatch")
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(pub_key_bytes)
+            sig_str = str(sig_obj.get("value") or "")
+            raw_sig = base64.urlsafe_b64decode(sig_str + "=" * (-len(sig_str) % 4))
+            pub.verify(raw_sig, canon)
+        except Exception as exc:
+            raise CrystalRollbackError(f"anchor commitment signature invalid: {exc}") from exc
+
+
+def resolve_offstore_anchor_path(
+    store_path: str | os.PathLike[str],
+    *,
+    tenant_hash: str | None = None,
+    base_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Resolve an anchor path outside the resolved store directory tree.
+
+    An existing store file uses its resolved parent as the store boundary;
+    other store paths are treated as directories. When ``base_dir`` is omitted,
+    use ``<store_dir>.anchor`` or ``~/.whitemagic/anchors/<tenant_hash>/``.
+    Tenant hashes must use the canonical ``sha256:<64 lowercase hex>`` form
+    returned by :func:`compute_tenant_hash`.
+
+    This performs no writes or directory creation. It checks the current
+    resolved paths, including existing symlinks; it does not ensure independent
+    retention, a separate filesystem, or safety against later path replacement.
+    """
+    if tenant_hash is not None and (
+        not isinstance(tenant_hash, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", tenant_hash) is None
+    ):
+        raise ValueError("tenant_hash must be sha256:<64 lowercase hex digits>")
+    p = Path(store_path).resolve()
+    store_dir = p.parent if p.is_file() else p
+    if base_dir is not None:
+        anchor_root = Path(base_dir)
+    elif tenant_hash is not None:
+        anchor_root = Path.home() / ".whitemagic" / "anchors" / tenant_hash
+    else:
+        anchor_root = store_dir.parent / f"{store_dir.name}.anchor"
+    candidate = (anchor_root / "commitment.json").resolve()
+    if candidate.is_relative_to(store_dir):
+        raise ValueError("anchor commitment path must be outside the resolved store directory")
+    return candidate
+
+
+def _ensure_private_dir(target: Path, *, managed_ancestor: Path | None = None) -> None:
+    """Create directories up to ``target`` with 0700 permissions and no managed symlinks."""
+    resolved_ancestor = managed_ancestor.absolute() if managed_ancestor is not None else target.parent.absolute()
+    chain: list[Path] = []
+    cur = target.absolute()
+    while True:
+        chain.append(cur)
+        if cur == cur.parent or (cur.exists() and (cur == resolved_ancestor or resolved_ancestor not in cur.parents)):
+            break
+        cur = cur.parent
+    for directory in reversed(chain):
+        if os.path.islink(directory):
+            if directory == chain[-1] and directory != target.absolute():
+                continue
+            raise CrystalVerificationError(f"refusing symlinked storage directory: {directory}")
+        if directory.exists():
+            st = os.lstat(directory)
+            if not stat.S_ISDIR(st.st_mode):
+                raise CrystalVerificationError(f"storage path is not a directory: {directory}")
+            if directory == target.absolute() and os.name == "posix" and st.st_uid == os.getuid() and (st.st_mode & 0o077):
+                os.chmod(directory, 0o700)
+        else:
+            os.mkdir(directory, 0o700)
+            if os.name == "posix":
+                os.chmod(directory, 0o700)
+
+
+def _read_json_nofollow(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> Any | None:
+    """Read JSON from a non-symlink regular file; return None if absent."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CrystalVerificationError(f"refusing unsafe storage file {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CrystalVerificationError(f"storage path must be a regular file: {path}")
+        if st.st_size > max_bytes:
+            raise CrystalVerificationError(f"storage file exceeds {max_bytes} bytes: {path}")
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            raw = stream.read(max_bytes + 1)
+            if len(raw.encode("utf-8")) > max_bytes:
+                raise CrystalVerificationError(f"storage file exceeds {max_bytes} bytes: {path}")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise CrystalVerificationError(f"corrupted JSON in storage file {path}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_json_atomic(path: Path, payload: Any, *, mode: int = 0o600) -> None:
+    """Atomically write JSON without following a symlink at ``path``."""
+    if os.path.islink(path):
+        raise CrystalVerificationError(f"refusing to write through symlink: {path}")
+    encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp_path, flags, mode)
+    try:
+        view = memoryview(encoded)
+        written = 0
+        while written < len(encoded):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError("short write while persisting crystal state")
+            written += n
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    if os.path.islink(path):
+        os.unlink(tmp_path)
+        raise CrystalVerificationError(f"refusing to replace symlink: {path}")
+    os.replace(tmp_path, path)
+    if os.name == "posix":
+        os.chmod(path, mode)
+
+
+def _default_anchor_base_dir(store_dir: Path, tenant_hash: str) -> tuple[Path, Path]:
+    """Return ``(managed_root, scoped_anchor_dir)`` outside ``store_dir``."""
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg and Path(xdg).is_absolute():
+        managed_root = Path(xdg)
+        anchor_root = managed_root / "whitemagic" / "anchors"
+    else:
+        managed_root = Path.home()
+        anchor_root = managed_root / ".whitemagic" / "anchors"
+    store_scope = hashlib.sha256(str(store_dir).encode("utf-8")).hexdigest()[:16]
+    return managed_root, anchor_root / tenant_hash / store_scope
+
+
+def _load_or_create_offstore_anchor_seed(key_path: Path) -> bytes:
+    """Load or atomically provision a 32-byte Ed25519 anchor seed outside ``store_dir``."""
+    if os.path.islink(key_path):
+        raise CrystalVerificationError(f"refusing symlinked anchor key file: {key_path}")
+    flags_r = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(key_path, flags_r)
+    except FileNotFoundError:
+        seed = generate_key()
+        flags_w = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            wfd = os.open(key_path, flags_w, 0o600)
+        except FileExistsError:
+            return _load_or_create_offstore_anchor_seed(key_path)
+        try:
+            os.write(wfd, seed)
+            os.fsync(wfd)
+        finally:
+            os.close(wfd)
+        return seed
+    except OSError as exc:
+        raise CrystalVerificationError(f"refusing unsafe anchor key file {key_path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CrystalVerificationError(f"anchor key must be a regular file: {key_path}")
+        if os.name == "posix" and st.st_mode & 0o077:
+            raise CrystalVerificationError(f"anchor key permissions must be 0600 or stricter: {key_path}")
+        raw = os.read(fd, 65)
+    finally:
+        os.close(fd)
+    if len(raw) == 32:
+        return raw
+    if len(raw.strip()) == 64:
+        return bytes.fromhex(raw.strip().decode("ascii"))
+    raise CrystalVerificationError(f"invalid anchor key length in {key_path}")
+
+
 def verify_and_unseal_crystal_set(
     crystals: list[dict[str, Any]],
     key: bytes,
@@ -549,13 +849,17 @@ def verify_and_unseal_crystal_set(
     *,
     expected_commitment: dict[str, Any] | None = None,
     anchor_public_key: bytes | None = None,
+    erasures: list[dict[str, Any]] | None = None,
+    require_anchor: bool = True,
 ) -> list[bytes]:
     """Read-path verifier for an ordered crystal set before session resumption (I6/I7).
 
     Checks:
-      1. Optional anchored export commitment (signature, tenant_hash, high-water count,
+      1. Anchored export commitment (signature, tenant_hash, high-water count,
          anchored head_crystal_id, and ordered_crystal_ids_digest) -> rejects T9 whole-store
-         rollback and T2 tail truncation.
+         rollback and T2 tail truncation. Required by default (Phase 2 strict policy);
+         pass require_anchor=False to explicitly opt out. The flag must be a
+         boolean; other values are rejected even when a commitment is supplied.
       2. Context binding (tenant_hash == expected_tenant_hash) -> rejects T6 cross-context replay.
       3. Lineage DAG continuity (genesis parent is None; each subsequent crystal's
          parent_crystal_id equals the immediately preceding crystal_id) -> rejects
@@ -564,28 +868,28 @@ def verify_and_unseal_crystal_set(
          and AEAD decryption over AAD (cipher, tenant_hash, parent, created_at, metadata)
          -> rejects T1 payload edits, T5 forged records, and T8 metadata edits.
     """
+    if not isinstance(require_anchor, bool):
+        raise CrystalVerificationError("require_anchor must be a boolean")
+    if expected_commitment is None:
+        # Phase 2 strict anchor policy: default is True (fail-closed against rollback).
+        if require_anchor:
+            raise CrystalRollbackError(
+                "no off-store anchor commitment supplied; whole-store rollback (T9) and erasure "
+                "resurrection (T10) cannot be detected without an independently retained commitment. "
+                "Provide expected_commitment=... or pass require_anchor=False to explicitly opt out."
+            )
     if expected_commitment is not None:
-        if not isinstance(expected_commitment, dict) or expected_commitment.get("kind") != "wm.crystal-set-commitment":
-            raise CrystalRollbackError("invalid or missing crystal-set commitment")
-        if anchor_public_key is not None:
-            _require_crypto()
-            sig_obj = expected_commitment.get("sig")
-            if not isinstance(sig_obj, dict):
-                raise CrystalRollbackError("anchor commitment is unsigned")
-            unsigned = {
-                k: v for k, v in expected_commitment.items()
-                if k not in ("sig", "commitment_digest")
-            }
-            canon = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            try:
-                pub = Ed25519PublicKey.from_public_bytes(anchor_public_key)
-                sig_str = str(sig_obj.get("value") or "")
-                raw_sig = base64.urlsafe_b64decode(sig_str + "=" * (-len(sig_str) % 4))
-                pub.verify(raw_sig, canon)
-            except Exception as exc:
-                raise CrystalRollbackError(f"anchor commitment signature invalid: {exc}") from exc
-        if expected_commitment.get("tenant_hash") != expected_tenant_hash:
-            raise CrystalContextError("anchor commitment tenant_hash mismatch")
+        _validate_commitment_envelope(
+            expected_commitment,
+            expected_tenant_hash,
+            anchor_public_key=anchor_public_key,
+        )
+        _check_erasure_binding(
+            expected_commitment,
+            erasures,
+            [str(c.get("crystal_id", "")).lower() for c in crystals if isinstance(c, dict)],
+            "crystal set",
+        )
 
     plaintexts: list[bytes] = []
     seen_ids: set[str] = set()
@@ -635,6 +939,358 @@ def verify_and_unseal_crystal_set(
     return plaintexts
 
 
+class LocalCrystalStore:
+    """Stateful local Memory Crystal store with automatic off-store anchor persistence.
+
+    Stores sealed ``wm-crystal/1.0`` envelopes (``crystals.json``) and erasure
+    tombstones (``erasures.json``) inside ``store_dir``, while automatically
+    maintaining a signed erasure-aware ``wm.crystal-set-commitment`` outside
+    ``store_dir`` (defaulting to ``$XDG_STATE_HOME/whitemagic/anchors`` or
+    ``~/.whitemagic/anchors`` scoped by tenant and store directory).
+
+    Threat boundary note: keeping the anchor outside ``store_dir`` in user state
+    or an explicit ``anchor_base_dir`` defeats store-directory tampering,
+    whole-store snapshot rollback (T9), and erasure resurrection (T10) by an
+    attacker limited to ``store_dir``. Against an attacker with full-host write
+    access, supply an anchor path on a separate volume or pair commits with a
+    remote notary receipt.
+    """
+
+    STORE_FILE = "crystals.json"
+    ERASURES_FILE = "erasures.json"
+
+    def __init__(
+        self,
+        store_dir: str | os.PathLike[str],
+        *,
+        key: bytes,
+        tenant_id: str,
+        anchor_signing_key: bytes | None = None,
+        anchor_public_key: bytes | None = None,
+        anchor_base_dir: str | os.PathLike[str] | None = None,
+        anchor_path: str | os.PathLike[str] | None = None,
+        cipher: str = "aes-256-gcm",
+        kek_version: int | None = 1,
+        require_anchor: bool = True,
+        create: bool = True,
+    ) -> None:
+        _require_crypto()
+        self.key = _require_32b_key(key, "encryption key")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise ValueError("tenant_id must be a non-empty string")
+        if not isinstance(require_anchor, bool):
+            raise CrystalVerificationError("require_anchor must be a boolean")
+        if not isinstance(create, bool):
+            raise ValueError("create must be a boolean")
+        if kek_version is not None and (isinstance(kek_version, bool) or not isinstance(kek_version, int) or kek_version < 1):
+            raise ValueError("kek_version must be a positive integer or None")
+
+        self.tenant_id = tenant_id
+        self.tenant_hash = compute_tenant_hash(tenant_id)
+        self.cipher = _normalize_cipher(cipher)
+        self.kek_version = kek_version
+        self.require_anchor = require_anchor
+
+        raw_store = Path(store_dir)
+        if os.path.islink(raw_store):
+            raise CrystalVerificationError(f"refusing symlinked store directory: {raw_store}")
+        if raw_store.exists():
+            if not raw_store.is_dir():
+                raise CrystalVerificationError(f"store_dir is not a directory: {raw_store}")
+        elif not create:
+            raise CrystalVerificationError(f"store directory does not exist: {raw_store}")
+        else:
+            _ensure_private_dir(raw_store, managed_ancestor=raw_store.parent)
+        self.store_dir = raw_store.resolve()
+        self.crystals_path = self.store_dir / self.STORE_FILE
+        self.erasures_path = self.store_dir / self.ERASURES_FILE
+
+        if anchor_path is not None and anchor_base_dir is not None:
+            raise ValueError("specify at most one of anchor_path or anchor_base_dir")
+
+        if anchor_path is not None:
+            raw_anchor = Path(anchor_path)
+            if os.path.islink(raw_anchor) or os.path.islink(raw_anchor.parent):
+                raise CrystalVerificationError(f"refusing symlinked off-store anchor path: {raw_anchor}")
+            resolved_anchor = raw_anchor.resolve()
+            if resolved_anchor.is_relative_to(self.store_dir):
+                raise ValueError("anchor commitment path must be outside the resolved store directory")
+            self.anchor_path = resolved_anchor
+            self.anchor_dir = self.anchor_path.parent
+            managed_anchor_ancestor = self.anchor_dir.parent
+        else:
+            if anchor_base_dir is not None:
+                store_scope = hashlib.sha256(str(self.store_dir).encode("utf-8")).hexdigest()[:16]
+                raw_root = Path(anchor_base_dir)
+                if os.path.islink(raw_root):
+                    raise CrystalVerificationError(f"refusing symlinked anchor_base_dir: {raw_root}")
+                scoped_base = raw_root / self.tenant_hash / store_scope
+                managed_anchor_ancestor = raw_root.resolve()
+            else:
+                managed_root, scoped_base = _default_anchor_base_dir(self.store_dir, self.tenant_hash)
+                managed_anchor_ancestor = managed_root.resolve() if managed_root.exists() else managed_root
+            for candidate_parent in (scoped_base, scoped_base.parent, scoped_base / "commitment.json"):
+                if os.path.islink(candidate_parent):
+                    raise CrystalVerificationError(f"refusing symlinked off-store anchor location: {candidate_parent}")
+            # Validate boundary before creating directories.
+            resolved_candidate = resolve_offstore_anchor_path(
+                self.store_dir,
+                tenant_hash=self.tenant_hash,
+                base_dir=scoped_base,
+            )
+            self.anchor_path = resolved_candidate
+            self.anchor_dir = resolved_candidate.parent
+
+        _ensure_private_dir(self.anchor_dir, managed_ancestor=managed_anchor_ancestor)
+        # Re-validate after directory creation in case an intermediate path resolved inward.
+        if self.anchor_path.resolve().is_relative_to(self.store_dir):
+            raise ValueError("anchor commitment path must be outside the resolved store directory")
+
+        self._anchor_signing_key: bytes | None = None
+        if anchor_signing_key is not None:
+            seed = _require_32b_key(anchor_signing_key, "anchor_signing_key")
+            derived_pub = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            )
+            if anchor_public_key is not None and _require_32b_key(anchor_public_key, "anchor_public_key") != derived_pub:
+                raise ValueError("anchor_public_key does not match anchor_signing_key")
+            self._anchor_signing_key = seed
+            self.anchor_public_key = derived_pub
+        elif anchor_public_key is not None:
+            self.anchor_public_key = _require_32b_key(anchor_public_key, "anchor_public_key")
+        else:
+            seed = _load_or_create_offstore_anchor_seed(self.anchor_dir / "anchor.key")
+            self._anchor_signing_key = seed
+            self.anchor_public_key = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            )
+
+        has_crystals = self.crystals_path.exists() or os.path.islink(self.crystals_path)
+        has_erasures = self.erasures_path.exists() or os.path.islink(self.erasures_path)
+        has_anchor = self.anchor_path.exists() or os.path.islink(self.anchor_path)
+        if not has_crystals and not has_erasures and not has_anchor:
+            if not create:
+                raise CrystalRollbackError("crystal store and off-store anchor do not exist")
+            if self._anchor_signing_key is None:
+                raise CrystalVerificationError("cannot initialize a new store without anchor_signing_key")
+            genesis = compute_crystal_set_commitment(
+                [],
+                self.tenant_hash,
+                signing_key=self._anchor_signing_key,
+                erasures=[],
+            )
+            _write_json_atomic(self.crystals_path, [], mode=0o600)
+            _write_json_atomic(self.erasures_path, [], mode=0o600)
+            _write_json_atomic(self.anchor_path, genesis, mode=0o600)
+
+    def load_envelopes(self) -> list[dict[str, Any]]:
+        data = _read_json_nofollow(self.crystals_path)
+        if data is None:
+            raise CrystalRollbackError(f"missing crystal store file: {self.crystals_path}")
+        if not isinstance(data, list):
+            raise CrystalVerificationError("crystals.json must contain a JSON list")
+        return data
+
+    def load_erasures(self) -> list[dict[str, Any]]:
+        data = _read_json_nofollow(self.erasures_path)
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise CrystalVerificationError("erasures.json must contain a JSON list")
+        return data
+
+    def load_anchor(self) -> dict[str, Any] | None:
+        if os.path.islink(self.anchor_path) or os.path.islink(self.anchor_dir):
+            raise CrystalVerificationError("refusing symlinked off-store anchor location")
+        if self.anchor_path.resolve().is_relative_to(self.store_dir):
+            raise CrystalRollbackError("anchor path points inside store directory")
+        data = _read_json_nofollow(self.anchor_path)
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise CrystalRollbackError("off-store anchor commitment must be a JSON object")
+        return data
+
+    @staticmethod
+    def _progress_key(commitment: dict[str, Any]) -> tuple[int, int]:
+        count = int(commitment.get("count", 0))
+        erasure_count = int(commitment.get("erasure_count", 0))
+        revision = int(commitment.get("revision", count + erasure_count))
+        return (revision, erasure_count)
+
+    def _verify_current(self, *, anchor_public_key: bytes | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None, list[bytes]]:
+        envelopes = self.load_envelopes()
+        erasures = self.load_erasures()
+        commitment = self.load_anchor()
+        if commitment is None and self.require_anchor:
+            raise CrystalRollbackError(
+                f"missing off-store anchor commitment at {self.anchor_path}; failing closed"
+            )
+        plaintexts = verify_and_unseal_crystal_set(
+            envelopes,
+            self.key,
+            self.tenant_hash,
+            expected_commitment=commitment,
+            anchor_public_key=(anchor_public_key or self.anchor_public_key),
+            erasures=erasures,
+            require_anchor=self.require_anchor,
+        )
+        return envelopes, erasures, commitment, plaintexts
+
+    def verify_and_unseal(self, *, anchor_public_key: bytes | None = None) -> list[bytes]:
+        """Verify off-store anchor, erasure bindings, lineage, and unseal all crystals."""
+        _, _, _, plaintexts = self._verify_current(anchor_public_key=anchor_public_key)
+        return plaintexts
+
+    def read_all(self) -> list[dict[str, Any]]:
+        """Verify store integrity against off-store anchor and return unsealed records."""
+        envelopes, _, _, plaintexts = self._verify_current()
+        records: list[dict[str, Any]] = []
+        for env, pt in zip(envelopes, plaintexts):
+            records.append({
+                "crystal_id": env["crystal_id"],
+                "parent_crystal_id": env.get("parent_crystal_id"),
+                "created_at": env["created_at"],
+                "metadata_public": dict(env.get("metadata_public") or {}),
+                "plaintext": pt,
+            })
+        return records
+
+    def append(
+        self,
+        content: str | bytes | dict[str, Any],
+        *,
+        metadata_public: dict[str, Any] | None = None,
+        sign_envelope: bool = True,
+        client_signing_key: bytes | None = None,
+    ) -> dict[str, Any]:
+        """Seal, link, persist, and advance the off-store anchor commitment."""
+        if self._anchor_signing_key is None:
+            raise CrystalVerificationError("anchor_signing_key is required for store writes")
+        if not isinstance(sign_envelope, bool):
+            raise ValueError("sign_envelope must be a boolean")
+        envelopes, erasures, prev_commitment, _ = self._verify_current()
+        parent_id = envelopes[-1]["crystal_id"] if envelopes else None
+        env = seal_crystal(
+            content,
+            self.key,
+            self.tenant_id,
+            parent_crystal_id=parent_id,
+            metadata_public=metadata_public,
+            cipher=self.cipher,
+            kek_version=self.kek_version,
+        )
+        if sign_envelope:
+            signer = client_signing_key or self._anchor_signing_key
+            env = sign_crystal_envelope(env, signer)
+        new_envelopes = envelopes + [env]
+        new_commitment = compute_crystal_set_commitment(
+            new_envelopes,
+            self.tenant_hash,
+            signing_key=self._anchor_signing_key,
+            erasures=erasures,
+        )
+        if prev_commitment is not None and self._progress_key(new_commitment) <= self._progress_key(prev_commitment):
+            raise CrystalRollbackError("refusing non-monotonic anchor progression on append")
+        _write_json_atomic(self.crystals_path, new_envelopes, mode=0o600)
+        _write_json_atomic(self.anchor_path, new_commitment, mode=0o600)
+        return env
+
+    def erase(
+        self,
+        crystal_id: str | None = None,
+        *,
+        erasure_class: str = "access_control_and_ciphertext_purge",
+        erase_descendants: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Erase the tail (or suffix from ``crystal_id``), record tombstones, and advance the off-store anchor."""
+        if self._anchor_signing_key is None:
+            raise CrystalVerificationError("anchor_signing_key is required for store erasures")
+        if not isinstance(erase_descendants, bool):
+            raise ValueError("erase_descendants must be a boolean")
+        envelopes, erasures, prev_commitment, _ = self._verify_current()
+        if not envelopes:
+            raise CrystalVerificationError("cannot erase from an empty crystal store")
+        if crystal_id is None:
+            idx = len(envelopes) - 1
+        else:
+            match = CRYSTAL_ID_RE.fullmatch(crystal_id) if isinstance(crystal_id, str) else None
+            if not match:
+                raise ValueError("crystal_id must be a 64-hex SHA-256 identifier")
+            target_id = f"sha256:{match.group(1).lower()}"
+            idx = next(
+                (i for i, e in enumerate(envelopes) if str(e.get("crystal_id", "")).lower() == target_id),
+                -1,
+            )
+            if idx < 0:
+                raise ValueError(f"crystal_id not found in store: {crystal_id}")
+            if idx != len(envelopes) - 1 and not erase_descendants:
+                raise CrystalLineageError(
+                    "erasing an interior crystal breaks linear parent_crystal_id lineage; pass erase_descendants=True to erase suffix"
+                )
+        victims = envelopes[idx:]
+        remaining = envelopes[:idx]
+        erased_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tombstones: list[dict[str, Any]] = []
+        for victim in reversed(victims):
+            tombstone: dict[str, Any] = {
+                "crystal_id": str(victim["crystal_id"]).lower(),
+                "erased_at": erased_at,
+                "class": erasure_class,
+            }
+            meta = victim.get("metadata_public")
+            if isinstance(meta, dict) and "slot" in meta:
+                tombstone["slot"] = meta["slot"]
+            tombstones.append(tombstone)
+        new_erasures = erasures + tombstones
+        new_commitment = compute_crystal_set_commitment(
+            remaining,
+            self.tenant_hash,
+            signing_key=self._anchor_signing_key,
+            erasures=new_erasures,
+        )
+        if prev_commitment is not None:
+            prev_rev, prev_er = self._progress_key(prev_commitment)
+            new_rev, new_er = self._progress_key(new_commitment)
+            if new_er <= prev_er or new_rev < prev_rev:
+                raise CrystalRollbackError("refusing non-monotonic anchor progression on erase")
+        _write_json_atomic(self.crystals_path, remaining, mode=0o600)
+        _write_json_atomic(self.erasures_path, new_erasures, mode=0o600)
+        _write_json_atomic(self.anchor_path, new_commitment, mode=0o600)
+        return tombstones
+
+    def verify_third_party(
+        self,
+        signer_public_key: bytes | None = None,
+        *,
+        notarization: dict[str, Any] | None = None,
+        notary_public_key: bytes | None = None,
+        expected_highwater_digest: str | None = None,
+        expected_min_count: int | None = None,
+        pq_verifier=None,
+        expected_pq_public_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Run zero-KEK third-party audit against off-store anchor and erasure tombstones."""
+        envelopes = self.load_envelopes()
+        erasures = self.load_erasures()
+        commitment = self.load_anchor()
+        if commitment is None:
+            raise CrystalRollbackError(f"missing off-store anchor commitment at {self.anchor_path}")
+        return verify_crystal_set_third_party(
+            envelopes,
+            self.tenant_hash,
+            expected_commitment=commitment,
+            signer_public_key=(signer_public_key or self.anchor_public_key),
+            notarization=notarization,
+            notary_public_key=notary_public_key,
+            expected_highwater_digest=expected_highwater_digest,
+            expected_min_count=expected_min_count,
+            erasures=erasures,
+            pq_verifier=pq_verifier,
+            expected_pq_public_key=expected_pq_public_key,
+        )
+
+
 def sign_context_notarization(
     context_digest: str,
     notary_private_key: bytes,
@@ -681,6 +1337,7 @@ def verify_crystal_set_third_party(
     notary_public_key: bytes | None = None,
     expected_highwater_digest: str | None = None,
     expected_min_count: int | None = None,
+    erasures: list[dict[str, Any]] | None = None,
     pq_verifier=None,
     expected_pq_public_key: str | None = None,
 ) -> dict[str, Any]:
@@ -733,6 +1390,13 @@ def verify_crystal_set_third_party(
 
     if expected_commitment.get("tenant_hash") != expected_tenant_hash:
         raise CrystalContextError("anchor commitment tenant_hash mismatch")
+
+    _check_erasure_binding(
+        expected_commitment,
+        erasures,
+        [str(c.get("crystal_id", "")).lower() for c in crystals if isinstance(c, dict)],
+        "crystal set (third-party)",
+    )
 
     if expected_highwater_digest is not None and computed_comm_digest != expected_highwater_digest:
         raise CrystalRollbackError(

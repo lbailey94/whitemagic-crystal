@@ -6,7 +6,12 @@ import unittest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from whitemagic_crystal import CrystalClient, compute_crystal_set_commitment, generate_key
+from whitemagic_crystal import (
+    CrystalClient,
+    LocalCrystalStore,
+    compute_crystal_set_commitment,
+    generate_key,
+)
 from whitemagic_crystal.core import CrystalContextError, CrystalRollbackError, CrystalVerificationError
 
 
@@ -65,6 +70,42 @@ class TestAnchoredSet(unittest.TestCase):
         changed[0]["ciphertext"] = "AAAA"
         with self.assertRaises((ValueError, CrystalVerificationError)):
             self.verify(envelopes=changed)
+
+    def test_local_crystal_store_auto_persists_offstore_anchor(self):
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            store_dir = root / "store"
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "xdg")}):
+                store = LocalCrystalStore(store_dir, key=generate_key(), tenant_id="pkg-tenant")
+                self.assertFalse(store.anchor_path.is_relative_to(store.store_dir))
+                e1 = store.append("alpha", metadata_public={"slot": "k1"})
+                snap = root / "snap"
+                shutil.copytree(store_dir, snap)
+                e2 = store.append("beta", metadata_public={"slot": "k2"})
+                self.assertEqual([r["plaintext"] for r in store.read_all()], [b"alpha", b"beta"])
+
+                # Snapshot rollback of store_dir is rejected automatically.
+                shutil.rmtree(store_dir)
+                shutil.copytree(snap, store_dir)
+                with self.assertRaises(CrystalRollbackError):
+                    store.read_all()
+
+                # Erase e2 cleanly and reject pre-erasure resurrection.
+                store.crystals_path.write_text(__import__("json").dumps([e1, e2]), encoding="utf-8")
+                snap2 = root / "snap2"
+                shutil.copytree(store_dir, snap2)
+                store.erase(e2["crystal_id"])
+                self.assertEqual([r["plaintext"] for r in store.read_all()], [b"alpha"])
+                shutil.rmtree(store_dir)
+                shutil.copytree(snap2, store_dir)
+                with self.assertRaises(CrystalRollbackError):
+                    store.read_all()
 
 
 if __name__ == "__main__":

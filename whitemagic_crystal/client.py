@@ -252,6 +252,7 @@ class CrystalClient:
         expected_commitment: dict[str, Any],
         *,
         anchor_public_key: bytes,
+        erasures: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Check a set against an independently retained signed commitment.
 
@@ -266,16 +267,18 @@ class CrystalClient:
             raise ValueError("anchor_public_key must be a trusted 32-byte Ed25519 public key")
         if not isinstance(expected_commitment, dict):
             raise CrystalRollbackError("expected_commitment must be an independently retained signed commitment")
-        expected_keys = {
+        base_keys = {
             "kind", "version", "spec", "tenant_hash", "count",
             "ordered_crystal_ids_digest", "head_crystal_id", "retrieved_at",
             "commitment_digest", "sig",
         }
+        erasure_keys = {"erasure_count", "erased_crystal_ids_digest", "revision"}
         sig = expected_commitment.get("sig")
         count = expected_commitment.get("count")
         digest_pattern = r"sha256:[0-9a-f]{64}"
+        present_keys = set(expected_commitment)
         if (
-            set(expected_commitment) != expected_keys
+            present_keys not in (base_keys, base_keys | erasure_keys)
             or expected_commitment.get("kind") != "wm.crystal-set-commitment"
             or type(expected_commitment.get("version")) is not int
             or expected_commitment.get("version") != 1
@@ -300,6 +303,9 @@ class CrystalClient:
             raise CrystalRollbackError("commitment digest mismatch")
         verify_and_unseal_crystal_set(
             envelopes, self.key, self.tenant_hash,
-            expected_commitment=expected_commitment, anchor_public_key=anchor_public_key,
+            expected_commitment=expected_commitment,
+            anchor_public_key=anchor_public_key,
+            erasures=erasures,
+            require_anchor=True,
         )
         return True
