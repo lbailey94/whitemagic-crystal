@@ -3,9 +3,8 @@ from __future__ import annotations
 import hashlib
 import math
 import tempfile
+import unittest
 from pathlib import Path
-
-import pytest
 
 from whitemagic_crystal.core import LocalCrystalStore, generate_key
 from whitemagic_crystal.nuresa_packet import (
@@ -50,38 +49,44 @@ def _make_skill_packet(op_start: int, count: int, seed_offset: int, tag: str) ->
     )
 
 
-def test_valk4_orthogonal_compose_and_crystal_anchor_seal():
-    pkt_a = _make_skill_packet(0, 10, 0, "skill_a_kekkai")
-    pkt_b = _make_skill_packet(14, 10, 7, "skill_b_poincare")
+class NuresaPacketTests(unittest.TestCase):
+    def test_valk4_orthogonal_compose_and_crystal_anchor_seal(self) -> None:
+        pkt_a = _make_skill_packet(0, 10, 0, "skill_a_kekkai")
+        pkt_b = _make_skill_packet(14, 10, 7, "skill_b_poincare")
 
-    assert len(pkt_a) <= VALK4_MAX_PACKET_BYTES
-    assert len(pkt_b) <= VALK4_MAX_PACKET_BYTES
+        self.assertLessEqual(len(pkt_a), VALK4_MAX_PACKET_BYTES)
+        self.assertLessEqual(len(pkt_b), VALK4_MAX_PACKET_BYTES)
 
-    composed, meta = compose_valk4_orthogonal(pkt_a, pkt_b)
-    assert meta["within_64k_sram_limit"] is True
-    assert len(composed) <= VALK4_MAX_PACKET_BYTES
-    assert meta["max_subspace_cross_dot"] < 1e-5
-    assert meta["engrams_count"] == 20
+        composed, meta = compose_valk4_orthogonal(pkt_a, pkt_b)
+        self.assertTrue(meta["within_64k_sram_limit"])
+        self.assertLessEqual(len(composed), VALK4_MAX_PACKET_BYTES)
+        self.assertLess(meta["max_subspace_cross_dot"], 1e-5)
+        self.assertEqual(meta["engrams_count"], 20)
 
-    parsed = parse_valk4_packet(composed)
-    for k in range(0, 10):
-        assert parsed.is_committed(k)
-    for k in range(14, 24):
-        assert parsed.is_committed(k)
+        parsed = parse_valk4_packet(composed)
+        for k in range(0, 10):
+            self.assertTrue(parsed.is_committed(k))
+        for k in range(14, 24):
+            self.assertTrue(parsed.is_committed(k))
 
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        store = LocalCrystalStore(
-            root / "store",
-            key=generate_key(),
-            tenant_id="stage4c-nuresa",
-            anchor_base_dir=root / "anchors",
-        )
-        receipt = seal_and_verify_valk4_in_store(store, composed, skill_label="skill_a_plus_b_orth")
-        assert receipt["within_64k_sram_limit"] is True
-        assert receipt["packet_bytes"] == len(composed)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = LocalCrystalStore(
+                root / "store",
+                key=generate_key(),
+                tenant_id="stage4c-nuresa",
+                anchor_base_dir=root / "anchors",
+            )
+            receipt = seal_and_verify_valk4_in_store(
+                store, composed, skill_label="skill_a_plus_b_orth"
+            )
+            self.assertTrue(receipt["within_64k_sram_limit"])
+            self.assertEqual(receipt["packet_bytes"], len(composed))
+
+    def test_valk4_rejects_oversized_packet(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            parse_valk4_packet(b"VALK4\x00\x02\x03" + b"\x00" * VALK4_MAX_PACKET_BYTES)
 
 
-def test_valk4_rejects_oversized_packet():
-    with pytest.raises(ValueError, match="exceeds"):
-        parse_valk4_packet(b"VALK4\x00\x02\x03" + b"\x00" * VALK4_MAX_PACKET_BYTES)
+if __name__ == "__main__":
+    unittest.main()
