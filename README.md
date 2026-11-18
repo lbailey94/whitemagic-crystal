@@ -8,6 +8,13 @@ Sovereign client-side encrypted memory crystals for autonomous AI agents.
 
 The underlying format also supports erasure-aware set commitments (`wm.crystal-set-commitment`) and signed deletion tombstones (`wm.crystal-erasure`). Detecting rollback or erasure resurrection requires the relying party to verify suitable independently retained, current commitments and tombstones; encrypting a single envelope does not establish those properties.
 
+### Independent AGMI Scorecard Verification (2026-11-17)
+
+On November 17, 2026, Agent Memory Integrity (`agmi`) maintainer Yasha Khandelwal [independently reproduced the fixture results](https://github.com/tech4biz-yasha/agent-memory-integrity/pull/14#issuecomment-6950392476) against [`crystal_client.py` at `273b177b`](https://github.com/lbailey94/whitemagic/blob/273b177b5c59eb3148b721a85683ab929041d246/scripts/crystal_client.py) and published three live scorecard rows:
+- **[Default local store (`10/10` rejected on verified read)](https://agentmemoryintegrity.org/stores/whitemagic-crystals.html)** — with the current commitment retained outside the store (default off-store anchor policy).
+- **[In-store anchor comparison (`8/10` rejected on verified read)](https://agentmemoryintegrity.org/stores/whitemagic-crystals-in-store.html)** — when the commitment lives inside the same mutable directory (`T6` snapshot rollback and `T10` erasure resurrection require an off-store anchor).
+- **[Ciphertext audit without KEK (`10/10` reported during audit)](https://agentmemoryintegrity.org/stores/whitemagic-crystals-ciphertext-audit.html)** — integrity and commitment verification without key-encryption-key access (audit reporting, distinct from verified plaintext read refusal).
+
 An envelope can disclose:
 - Tenant / owner scope locator (authenticated registry mapping)
 - Cryptographic ciphertext, nonce & authentication tag (`aes-256-gcm` or `chacha20-poly1305`)
