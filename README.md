@@ -2,6 +2,27 @@
 
 Sovereign client-side encrypted memory crystals for autonomous AI agents.
 
+## Quickstart
+
+With Python 3.10 or newer, install the [published 0.1.0 package](https://pypi.org/project/whitemagic-crystal/0.1.0/) in a virtual environment. The example seals and opens a test note locally with no account or hosted token. After installation, it can run offline.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install whitemagic-crystal==0.1.0
+.venv/bin/python - <<'PY'
+from secrets import token_bytes
+from whitemagic_crystal import CrystalClient
+
+note = b"The first Crystal note is violet."
+client = CrystalClient(tenant_id="quickstart", key=token_bytes(32))
+envelope = client.seal(note, sign=False)
+assert client.unseal(envelope) == note
+print("Opened the original note.")
+PY
+```
+
+The test key lives only in this process. For records you plan to reopen, retain the original key securely and keep a protected recovery copy. See [hosted Crystal access](https://www.whitemagic.dev/hosted#crystals) for the separate provisioned vault workflow.
+
 ## Overview
 
 `whitemagic-crystal` seals content locally with authenticated encryption (AES-256-GCM or ChaCha20-Poly1305) before using this client to send an envelope to a hosted vault. Callers remain responsible for protecting plaintext and retaining the encryption key.
@@ -27,8 +48,7 @@ The client does not put the plaintext or encryption key in the envelope. Avoid p
 
 ## Installation
 
-The APIs below describe the unreleased `0.2.0.dev0` source. To review or use
-this candidate, install this checkout in an isolated Python environment:
+The hosted example below uses the unreleased `0.2.0.dev0` source. To review or use this candidate, install this checkout in an isolated Python environment:
 
 ```bash
 python -m pip install .
@@ -36,11 +56,7 @@ python -m pip install .
 python -m pip install -e .
 ```
 
-Installing only the name `whitemagic-crystal` selects a published PyPI release,
-which can have a different API. Use that release's documentation when working
-with its package; merging this source does not publish a new PyPI version.
-
-## Quickstart
+## Hosted quickstart for the source candidate
 
 First generate a 32-byte encryption key with a trusted random generator and retain it in your secret manager, with a protected recovery backup. Supply the **same** key on each run as base64 in `WM_CRYSTAL_KEY`, or pass its bytes as `key=` from your secret manager. Configure the environment through your deployment's secret mechanism rather than pasting the key into source code or shell history. Treat access to that key as access to the encrypted memories.
 
@@ -108,17 +124,19 @@ Before a push, the exact pending envelope is committed to SQLite. If `auto_push`
 
 Revision checks reject writes from stale manager instances before sending another envelope; reopen to reload the latest local state. Use one owner per session to coordinate live requests and reconciliation. The journal does not establish remote freshness or prevent replay of an older valid database. `clear()` resets the local session (including the journal when configured) and does not delete hosted crystals. SQLite transaction recovery is used; power-loss behavior depends on the filesystem and storage. Public envelope tags still disclose session ID and message role.
 
-## CLI Usage
+## CLI usage
+
+Use the Python example above to seal a note offline. The CLI's `seal` command looks up the gateway-assigned owner locator using a provisioned `WM_CRYSTAL_TOKEN` or a protected `--token-file`.
 
 ```bash
-# Generate key
-whitemagic-crystal keygen --cipher AES-256-GCM
+# Generate a key file for a new trial
+whitemagic-crystal genkey --out crystal.key
 
-# Seal local file
-whitemagic-crystal seal --tenant my-agent --key-hex <key> input.txt > crystal.json
+# Seal a file for the authenticated owner
+whitemagic-crystal seal --file input.txt --key crystal.key --out crystal.json
 
-# Unseal envelope
-whitemagic-crystal unseal --key-hex <key> crystal.json
+# Open the saved envelope locally
+whitemagic-crystal unseal --envelope crystal.json --key crystal.key
 ```
 
 ## License
