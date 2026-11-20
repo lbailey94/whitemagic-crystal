@@ -4,11 +4,11 @@ Sovereign client-side encrypted memory crystals for autonomous AI agents.
 
 ## Quickstart
 
-With Python 3.10 or newer, install the [published 0.1.0 package](https://pypi.org/project/whitemagic-crystal/0.1.0/) in a virtual environment. The example seals and opens a test note locally with no account or hosted token. After installation, it can run offline.
+With Python 3.10 or newer, install the [published 0.1.1 package](https://pypi.org/project/whitemagic-crystal/0.1.1/) in a virtual environment. The example seals and opens a test note locally with no account or hosted token. After installation, it can run offline.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install whitemagic-crystal==0.1.0
+.venv/bin/python -m pip install whitemagic-crystal==0.1.1
 .venv/bin/python - <<'PY'
 from secrets import token_bytes
 from whitemagic_crystal import CrystalClient
